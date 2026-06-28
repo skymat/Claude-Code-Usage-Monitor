@@ -1055,7 +1055,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 112;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -1162,6 +1162,16 @@ fn antigravity_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#8AB4F8")
     } else {
         Color::from_hex("#1967D2")
+    }
+}
+
+fn percent_alert_color(percent: f64) -> Option<Color> {
+    if percent >= 90.0 {
+        Some(Color::from_hex("#CF00FF"))
+    } else if percent >= 75.0 {
+        Some(Color::from_hex("#FFD700"))
+    } else {
+        None
     }
 }
 
@@ -3108,21 +3118,27 @@ fn draw_row(
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    let claude_value_color = percent_alert_color(claude_percent).unwrap_or_else(|| {
+        if use_model_text_colors {
+            claude_usage_text_color(is_dark)
+        } else {
+            *text_color
+        }
+    });
+    let codex_value_color = percent_alert_color(codex_percent).unwrap_or_else(|| {
+        if use_model_text_colors {
+            codex_usage_text_color(is_dark)
+        } else {
+            *text_color
+        }
+    });
+    let antigravity_value_color = percent_alert_color(antigravity_percent).unwrap_or_else(|| {
+        if use_model_text_colors {
+            antigravity_usage_text_color(is_dark)
+        } else {
+            *text_color
+        }
+    });
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));

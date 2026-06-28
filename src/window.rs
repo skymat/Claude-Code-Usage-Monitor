@@ -672,6 +672,7 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
     }
+
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -1058,6 +1059,7 @@ const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 112;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
+
 const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
@@ -1107,11 +1109,9 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    total_widget_width_for(
+        active_model_count(state.show_claude_code, state.show_codex, state.show_antigravity),
+    )
 }
 
 fn total_widget_width() -> i32 {

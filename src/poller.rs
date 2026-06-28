@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
-
 use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
@@ -144,6 +143,7 @@ struct AntigravityQuotaSummaryBucket {
     reset_time: Option<String>,
 }
 
+
 #[repr(C)]
 struct CredentialW {
     flags: u32,
@@ -185,6 +185,7 @@ pub fn poll(
         poll_antigravity,
     )
 }
+
 
 fn poll_with(
     show_claude_code: bool,
@@ -703,7 +704,8 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Err(_) => return Ok(None),
     };
 
-    let response: UsageResponse = match resp.into_json() {
+    let body = resp.into_string().unwrap_or_default();
+    let response: UsageResponse = match serde_json::from_str(&body) {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };

@@ -24,5 +24,8 @@ Desktop.ini
 workflow.cmd
 AGENTS.md
 
+# Notes de handoff locales (debug widget)
+NOTES-WIDGET-DISPARAIT.md
+
 # Local WinGet manifest generation output
 /manifests/

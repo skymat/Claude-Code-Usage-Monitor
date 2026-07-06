@@ -20,8 +20,8 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_TASKBAR_RECHECK,
+    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::theme;
@@ -84,6 +84,8 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    attached_taskbar_index: usize,
+    compact: bool,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -131,6 +133,10 @@ const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+/// Base command id for the dynamic "choose screen" submenu; item id = base + screen index.
+const IDM_SCREEN_BASE: u16 = 80;
+/// Hard cap on how many screens the menu will list (far beyond any real setup).
+const MAX_SCREEN_MENU_ITEMS: usize = 8;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -139,6 +145,10 @@ const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+
+/// How often the main-thread timer re-checks taskbar/monitor layout (see
+/// `recheck_taskbar_layout`).
+const TASKBAR_RECHECK_INTERVAL_MS: u32 = 3_000;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -545,7 +555,13 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.taskbar_hwnd = Some(taskbar.hwnd);
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
-        s.taskbar_index = index;
+        // Only reflects where we actually landed (may be clamped if fewer
+        // taskbars were found than requested, e.g. during a boot race before
+        // explorer has finished creating every monitor's taskbar). The
+        // persisted preference (`taskbar_index`) is deliberately left alone
+        // here - callers that represent an explicit user choice (drag, the
+        // screen picker menu) set it themselves.
+        s.attached_taskbar_index = index;
         s.embedded = true;
     }
     true
@@ -1062,6 +1078,17 @@ const RIGHT_MARGIN: i32 = 1;
 
 const WIDGET_HEIGHT: i32 = 46;
 
+/// Compact (single-screen) mode: no bars, so the row is just a label and a
+/// value string - shrink the font, the text column, and the surrounding
+/// spacing noticeably so the widget actually takes less room in the taskbar.
+const FONT_HEIGHT_NORMAL: i32 = -12;
+const FONT_HEIGHT_COMPACT: i32 = -9;
+const TEXT_WIDTH_COMPACT: i32 = 88;
+const DIVIDER_RIGHT_MARGIN_COMPACT: i32 = 4;
+const LABEL_WIDTH_COMPACT: i32 = 14;
+const LABEL_RIGHT_MARGIN_COMPACT: i32 = 4;
+const MODEL_RIGHT_MARGIN_COMPACT: i32 = 2;
+
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
     let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
@@ -1093,36 +1120,62 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+fn total_widget_width_for(active_models: i32, compact: bool) -> i32 {
+    let model_width = if compact {
+        sc(TEXT_WIDTH_COMPACT)
+    } else {
+        let bar_segments = row_bar_segment_count(active_models);
+        (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+            + sc(BAR_RIGHT_MARGIN)
+            + sc(TEXT_WIDTH)
+    };
+    let divider_right_margin = if compact {
+        DIVIDER_RIGHT_MARGIN_COMPACT
+    } else {
+        DIVIDER_RIGHT_MARGIN
+    };
+    let label_width = if compact { LABEL_WIDTH_COMPACT } else { LABEL_WIDTH };
+    let label_right_margin = if compact {
+        LABEL_RIGHT_MARGIN_COMPACT
+    } else {
+        LABEL_RIGHT_MARGIN
+    };
+    let model_right_margin = if compact {
+        MODEL_RIGHT_MARGIN_COMPACT
+    } else {
+        MODEL_RIGHT_MARGIN
+    };
 
     sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
+        + sc(divider_right_margin)
+        + sc(label_width)
+        + sc(label_right_margin)
         + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
+        + sc(model_right_margin) * (active_models - 1)
         + sc(RIGHT_MARGIN)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     total_widget_width_for(
         active_model_count(state.show_claude_code, state.show_codex, state.show_antigravity),
+        state.compact,
     )
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let (active_models, compact) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
+            .map(|s| {
+                (
+                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    s.compact,
+                )
+            })
+            .unwrap_or((1, false))
     };
-    total_widget_width_for(active_models)
+    total_widget_width_for(active_models, compact)
 }
 
 fn claude_accent_color() -> Color {
@@ -1255,6 +1308,7 @@ pub fn run() {
             settings.show_codex,
             settings.show_antigravity,
         );
+        let initial_compact = native_interop::find_taskbars().len() <= 1;
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1262,7 +1316,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            total_widget_width_for(initial_model_count, initial_compact),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1331,6 +1385,8 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                attached_taskbar_index: 0,
+                compact: initial_compact,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1381,6 +1437,10 @@ pub fn run() {
                 .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+
+        // Periodically re-check the taskbar/monitor layout: heals a boot-race
+        // fallback screen and flips compact mode live on monitor changes.
+        SetTimer(hwnd, TIMER_TASKBAR_RECHECK, TASKBAR_RECHECK_INTERVAL_MS, None);
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -1445,6 +1505,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        compact,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1468,6 +1529,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.compact,
             ),
             None => return,
         }
@@ -1565,6 +1627,7 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            compact,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1641,6 +1704,7 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    compact: bool,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1691,7 +1755,12 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let content_x = sc(LEFT_DIVIDER_W)
+            + sc(if compact {
+                DIVIDER_RIGHT_MARGIN_COMPACT
+            } else {
+                DIVIDER_RIGHT_MARGIN
+            });
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
 
@@ -1699,8 +1768,13 @@ fn paint_content(
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
         let font_name = native_interop::wide_str("Segoe UI");
+        let font_height = if compact {
+            FONT_HEIGHT_COMPACT
+        } else {
+            FONT_HEIGHT_NORMAL
+        };
         let font = CreateFontW(
-            sc(-12),
+            sc(font_height),
             0,
             0,
             0,
@@ -1737,6 +1811,7 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            compact,
         );
         draw_row(
             hdc,
@@ -1758,6 +1833,7 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            compact,
         );
 
         SelectObject(hdc, old_font);
@@ -2161,6 +2237,52 @@ fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> 
     (anchor_bottom - widget_height).max(anchor_top)
 }
 
+/// Periodic self-heal, run from a main-thread timer (not the background
+/// watchdog thread - Win32 hooks and reparenting need to happen on the
+/// window's own thread).
+///
+/// Covers two cases that can change without any user action:
+/// - Boot race: at startup fewer taskbars existed than the preferred screen
+///   needed, so we landed on a fallback. Once every taskbar is up, snap back
+///   to the preferred screen automatically.
+/// - Monitor count change: a screen gets connected/disconnected, so compact
+///   (single-screen) mode should flip on/off live.
+fn recheck_taskbar_layout(hwnd: HWND) {
+    let (dragging, attached_index, desired_index, was_compact) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (s.dragging, s.attached_taskbar_index, s.taskbar_index, s.compact),
+            None => return,
+        }
+    };
+    if dragging {
+        return;
+    }
+
+    let taskbar_count = native_interop::find_taskbars().len();
+    let now_compact = taskbar_count <= 1;
+    let mut needs_reposition = false;
+
+    if now_compact != was_compact {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.compact = now_compact;
+        }
+        needs_reposition = true;
+    }
+
+    if !now_compact && attached_index != desired_index && taskbar_count > desired_index {
+        if attach_to_taskbar(hwnd, desired_index) {
+            needs_reposition = true;
+        }
+    }
+
+    if needs_reposition {
+        position_at_taskbar();
+        render_layered();
+    }
+}
+
 /// WinEvent callback for tray icon location changes
 unsafe extern "system" fn on_tray_location_changed(
     _hook: HWINEVENTHOOK,
@@ -2313,6 +2435,9 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
+                }
+                TIMER_TASKBAR_RECHECK => {
+                    recheck_taskbar_layout(hwnd);
                 }
                 _ => {}
             }
@@ -2473,7 +2598,7 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        Some((s.attached_taskbar_index, s.drag_start_client_x))
                     } else {
                         None
                     }
@@ -2498,6 +2623,13 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                         if attach_to_taskbar(hwnd, target_index) {
+                            // Dragging onto a screen is an explicit user choice:
+                            // record it as the new preference.
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.taskbar_index = target_index;
+                            }
+                            drop(state);
                             position_at_taskbar();
                             render_layered();
                         }
@@ -2582,6 +2714,24 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                     position_at_taskbar();
+                }
+                id if (IDM_SCREEN_BASE..IDM_SCREEN_BASE + MAX_SCREEN_MENU_ITEMS as u16)
+                    .contains(&id) =>
+                {
+                    // Explicit choice from the screen picker: this becomes
+                    // the new persisted preference.
+                    let target_index = (id - IDM_SCREEN_BASE) as usize;
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.taskbar_index = target_index;
+                        }
+                    }
+                    if attach_to_taskbar(hwnd, target_index) {
+                        position_at_taskbar();
+                        render_layered();
+                    }
+                    save_state_settings();
                 }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
@@ -2725,6 +2875,7 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            attached_taskbar_index,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2739,6 +2890,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.attached_taskbar_index,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2751,6 +2903,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    0,
                 ),
             }
         };
@@ -2868,6 +3021,40 @@ fn show_context_menu(hwnd: HWND) {
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
+
+        // Screen submenu: only meaningful (and only shown) with more than one
+        // screen - lists whatever native_interop::find_taskbars() detects
+        // right now, so it always matches reality.
+        let detected_taskbars = native_interop::find_taskbars();
+        let screen_labels: Vec<Vec<u16>> = detected_taskbars
+            .iter()
+            .enumerate()
+            .take(MAX_SCREEN_MENU_ITEMS)
+            .map(|(i, _)| native_interop::wide_str(&format!("{} {}", strings.screen_menu, i + 1)))
+            .collect();
+        if screen_labels.len() > 1 {
+            let screen_menu = CreatePopupMenu().unwrap();
+            for (i, label_wide) in screen_labels.iter().enumerate() {
+                let flags = if i == attached_taskbar_index {
+                    MF_CHECKED
+                } else {
+                    MENU_ITEM_FLAGS(0)
+                };
+                let _ = AppendMenuW(
+                    screen_menu,
+                    flags,
+                    (IDM_SCREEN_BASE as usize) + i,
+                    PCWSTR::from_raw(label_wide.as_ptr()),
+                );
+            }
+            let screen_label = native_interop::wide_str(strings.screen_menu);
+            let _ = AppendMenuW(
+                settings_menu,
+                MF_POPUP,
+                screen_menu.0 as usize,
+                PCWSTR::from_raw(screen_label.as_ptr()),
+            );
+        }
 
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);
@@ -2997,6 +3184,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        compact,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -3018,6 +3206,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.compact,
             ),
             None => return,
         }
@@ -3083,6 +3272,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            compact,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3113,6 +3303,7 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    compact: bool,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -3140,13 +3331,25 @@ fn draw_row(
         }
     });
 
+    let label_width = if compact { LABEL_WIDTH_COMPACT } else { LABEL_WIDTH };
+    let label_right_margin = if compact {
+        LABEL_RIGHT_MARGIN_COMPACT
+    } else {
+        LABEL_RIGHT_MARGIN
+    };
+    let model_right_margin = if compact {
+        MODEL_RIGHT_MARGIN_COMPACT
+    } else {
+        MODEL_RIGHT_MARGIN
+    };
+
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
         let mut label_rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
+            right: x + sc(label_width),
             bottom: y + seg_h,
         };
         let _ = DrawTextW(
@@ -3156,7 +3359,7 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + sc(label_width) + sc(label_right_margin);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3168,8 +3371,9 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                compact,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, compact) + sc(model_right_margin);
         }
         if show_codex {
             draw_usage_bar(
@@ -3182,8 +3386,9 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                compact,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, compact) + sc(model_right_margin);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -3196,12 +3401,16 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                compact,
             );
         }
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
+fn model_usage_width(segment_count: i32, compact: bool) -> i32 {
+    if compact {
+        return sc(TEXT_WIDTH_COMPACT);
+    }
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH)
@@ -3217,6 +3426,7 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    compact: bool,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -3227,7 +3437,7 @@ fn draw_usage_bar(
         let percent_clamped = percent.clamp(0.0, 100.0);
         let segment_percent = 100.0 / segment_count as f64;
 
-        for i in 0..segment_count {
+        for i in 0..(if compact { 0 } else { segment_count }) {
             let seg_x = bar_x + i * (seg_w + seg_gap);
             let seg_start = (i as f64) * segment_percent;
             let seg_end = seg_start + segment_percent;
@@ -3272,12 +3482,17 @@ fn draw_usage_bar(
             }
         }
 
-        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
+        let text_x = if compact {
+            bar_x
+        } else {
+            bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN)
+        };
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let text_width = if compact { TEXT_WIDTH_COMPACT } else { TEXT_WIDTH };
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(TEXT_WIDTH),
+            right: text_x + sc(text_width),
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
